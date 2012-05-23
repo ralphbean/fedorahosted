@@ -7,7 +7,9 @@ from flask import Flask, request, session, g, redirect, url_for, abort, \
     render_template, flash, jsonify
 from flask.ext.sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import class_mapper
-from wtforms import Form, BooleanField, TextField, SelectField, validators
+from sqlalchemy.orm.properties import RelationshipProperty
+from wtforms import Form, BooleanField, TextField, SelectField, validators, \
+    FieldList
 import fedora.client
 import fedmsg
 
@@ -20,8 +22,43 @@ db = SQLAlchemy(app)
 fedmsg.init(name="fedorahosted")
 
 
+class JSONifiable(object):
+    """ A mixin for sqlalchemy models providing a .__json__ method. """
+
+    def __json__(self, recurse=True):
+        """ Returns a dict representation of the object.
+
+        Recursively evaluates .__json__() on its relationships.
+        """
+
+        properties = list(class_mapper(type(self)).iterate_properties)
+        relationships = [
+            p.key for p in properties if type(p) is RelationshipProperty
+        ]
+        attrs = [
+            p.key for p in properties if p.key not in relationships
+        ]
+
+        d = dict([(attr, getattr(self, attr)) for attr in attrs])
+
+        for attr in relationships:
+            d[attr] = self._expand(getattr(self, attr), recurse)
+
+        return d
+
+    def _expand(self, relation, recurse):
+        """ Return the __json__() or id of a sqlalchemy relationship. """
+        if hasattr(relation, 'all'):
+            return [self._expand(item, recurse) for item in relation.all()]
+
+        if recurse:
+            return relation.__json__(False)
+        else:
+            return relation.id
+
+
 # TODO: Move these out to their own file.
-class MailingList(db.Model):
+class MailingList(db.Model, JSONifiable):
     id = db.Column(db.Integer, primary_key=True)
     # mailman does not enforce a hard limit. SMTP specifies 64-char limit
     # on local-part, so use that.
@@ -33,7 +70,7 @@ class MailingList(db.Model):
                                                  lazy='dynamic'))
 
 
-class HostedRequest(db.Model):
+class HostedRequest(db.Model, JSONifiable):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(150), unique=True)
     pretty_name = db.Column(db.String(150), unique=True)
@@ -43,14 +80,6 @@ class HostedRequest(db.Model):
     owner = db.Column(db.String(32))  # 32 is the max username length in FAS
     completed = db.Column(db.Boolean, default=False)
 
-    def __json__(self):
-        """ Returns a dict representation of the object. """
-        attrs = [
-            prop.key for prop in class_mapper(HostedRequest).iterate_properties
-            if prop.key not in ['mailing_lists']
-        ]
-        return dict([(attr, getattr(self, attr)) for attr in attrs])
-
 
 class RequestForm(Form):
     project_name = TextField('Name (lowercase, alphanumeric only)',
@@ -58,13 +87,17 @@ class RequestForm(Form):
     project_pretty_name = TextField('Pretty Name',
                                     [validators.Length(min=1, max=150)])
     project_description = TextField('Short Description',
-                            [validators.Length(min=1, max=255)])
+                                    [validators.Length(min=1, max=255)])
     project_owner = TextField('Owner FAS Username',
                               [validators.Length(min=1, max=32)])
     project_scm = SelectField('SCM',
-                      choices=[('git', 'git'), ('svn', 'svn'), ('hg', 'hg')])
+                              choices=[('git', 'git'),
+                                       ('svn', 'svn'),
+                                       ('hg', 'hg')])
     project_trac = BooleanField('Trac Instance?')
-    # TODO: Handle mailing lists
+    project_mailing_lists = FieldList(TextField('Mailing List',
+                                                [validators.Length(max=64)]),
+                                      min_entries=1)
 
 
 @app.route('/', methods=['POST', 'GET'])
@@ -80,11 +113,23 @@ def hello():
             owner=form.project_owner.data)
         db.session.add(hosted_request)
         db.session.commit()
+
+        for entry in form.project_mailing_lists.entries:
+            if entry.data:
+                mailing_list = MailingList(
+                    name=entry.data,
+                    request_id=hosted_request.id)
+                db.session.add(mailing_list)
+                db.session.commit()
+
         fedmsg.send_message(
             modname='fedorahosted',
             topic='request.create',
             msg=hosted_request)
+
         return render_template('completed.html')
+
+    # GET, not POST.
     return render_template('index.html', form=form)
 
 
